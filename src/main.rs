@@ -37,6 +37,7 @@ struct SystemState {
 struct HardwareControllers {
     strip: Option<NeoPixelStrip>,
     mcps: Vec<Option<MCPController>>, // Slot index matches address offset (0 to 7 -> 0x20 to 0x27)
+    _gpio_resets: Option<gpiod::Lines<gpiod::Output>>, // Held in memory to keep reset lines pulled HIGH
 }
 
 struct AppContext {
@@ -116,12 +117,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- 🦀 NeuraSync Multi-Board Web Control Suite ---");
 
     // 1. Release hardware resets via GPIO RP1 chip
-    if let Err(e) = gpio::initialize_mcp_resets() {
-        eprintln!(
-            "[Warning] GPIO Hardware resets failed: {}. Continuing in case pins are held high...",
-            e
-        );
-    }
+    let gpio_resets = match gpio::initialize_mcp_resets() {
+        Ok(lines) => Some(lines),
+        Err(e) => {
+            eprintln!(
+                "[Warning] GPIO Hardware resets failed: {}. Continuing in case pins are held high...",
+                e
+            );
+            None
+        }
+    };
 
     // 2. Initialize physical NeoPixel strip (defaults to Blue startup colors)
     let strip = match NeoPixelStrip::new(64) {
@@ -172,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             active_color_index: 0,
             relay_states: [0x00; 8], // All relays off initially
         }),
-        hardware: Mutex::new(Some(HardwareControllers { strip, mcps })),
+        hardware: Mutex::new(Some(HardwareControllers { strip, mcps, _gpio_resets: gpio_resets })),
         tx: broadcast::channel(100).0,
     });
 
