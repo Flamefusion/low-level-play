@@ -1,0 +1,14 @@
+[package]
+name = "low-level-play"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Standard Linux spidev bindings
+spidev = "0.6.0"
+# For Linux standard GPIO interaction (using gpiod character device)
+gpiod = "0.2.1"
+# For standard Linux I2C interaction
+i2cdev = "0.6.0"
+# For managing binary operations (bitwise shifting, registers)
+nix = { version = "0.27", features = ["ioctl", "fs"] }
