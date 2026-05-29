@@ -20,7 +20,11 @@ pub fn initialize_mcp_resets() -> Result<gpiod::Lines<gpiod::Output>, Box<dyn st
 
     // Pull reset HIGH to release the MCP chips and boot them up!
     requested.set_values([true, true, true, true])?;
-    println!("MCP Chips successfully pulled out of Hardware Reset!");
+    
+    // Give the MCP23017 chips 20 milliseconds to fully boot and stabilize their internal oscillators
+    sleep(Duration::from_millis(20));
+    
+    println!("MCP Chips successfully pulled out of Hardware Reset and stabilized!");
 
     Ok(requested)
 }
