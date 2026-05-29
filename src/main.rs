@@ -30,14 +30,13 @@ const COLOR_PALETTE: [(u8, u8, u8); 8] = [
 
 struct SystemState {
     colors: [(u8, u8, u8); 64],
-    cursor_index: usize,
     active_color_index: usize,
-    relay_state: u8,
+    relay_states: [u8; 8], // One byte per chip (0x20 to 0x27)
 }
 
 struct HardwareControllers {
     strip: Option<NeoPixelStrip>,
-    mcp: Option<MCPController>,
+    mcps: Vec<Option<MCPController>>, // Slot index matches address offset (0 to 7 -> 0x20 to 0x27)
 }
 
 struct AppContext {
@@ -47,7 +46,7 @@ struct AppContext {
 }
 
 impl AppContext {
-    /// Writes the current software state directly to the physical SPI NeoPixels and I2C Relays
+    /// Writes the current software state directly to the physical SPI NeoPixels and I2C Relays across all 8 boards
     fn update_hardware(&self) {
         let state = self.state.lock().unwrap();
         let mut hw_lock = self.hardware.lock().unwrap();
@@ -56,9 +55,11 @@ impl AppContext {
             if let Some(ref mut s) = hw.strip {
                 let _ = s.show(&state.colors);
             }
-            // Update Relays
-            if let Some(ref mut mcp) = hw.mcp {
-                let _ = mcp.set_relays(state.relay_state);
+            // Update all 8 MCP Relay boards
+            for c in 0..8 {
+                if let Some(Some(mcp)) = hw.mcps.get_mut(c) {
+                    let _ = mcp.set_relays(state.relay_states[c]);
+                }
             }
         }
     }
@@ -69,14 +70,30 @@ impl AppContext {
         let payload = serde_json::json!({
             "type": "state",
             "colors": &state.colors[..],
-            "cursor": state.cursor_index,
             "active_color": state.active_color_index,
-            "relay_state": state.relay_state
+            "relay_states": state.relay_states
         });
         if let Ok(msg) = serde_json::to_string(&payload) {
             let _ = self.tx.send(msg);
         }
     }
+}
+
+/// Helper function to cycle through colors: Blue -> Red -> Green -> Yellow -> Purple -> Cyan -> Orange -> White -> Off -> Blue
+fn get_next_color(current: (u8, u8, u8)) -> (u8, u8, u8) {
+    if current == (0, 0, 0) {
+        return COLOR_PALETTE[0]; // Start back at Blue
+    }
+    for i in 0..8 {
+        if COLOR_PALETTE[i] == current {
+            if i == 7 {
+                return (0, 0, 0); // Turn Off
+            } else {
+                return COLOR_PALETTE[i + 1]; // Next color
+            }
+        }
+    }
+    COLOR_PALETTE[0] // Default fallback
 }
 
 #[derive(Deserialize)]
@@ -96,7 +113,7 @@ enum ClientCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("--- 🦀 NeuraSync Low-Level Web Control Suite ---");
+    println!("--- 🦀 NeuraSync Multi-Board Web Control Suite ---");
 
     // 1. Release hardware resets via GPIO RP1 chip
     if let Err(e) = gpio::initialize_mcp_resets() {
@@ -119,115 +136,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 3. Initialize I2C MCP23017 controller (Enables built-in pull-ups for Button board)
-    let mcp = match MCPController::new(1, 0x20) {
-        Ok(mut m) => {
-            if let Err(e) = m.initialize() {
-                eprintln!("[Warning] MCP23017 Initialization failed: {}.", e);
+    // 3. Scan and initialize all 8 possible MCP23017 controller addresses (0x20 through 0x27)
+    let mut mcps = Vec::new();
+    let mut active_mcp_count = 0;
+
+    for c in 0..8 {
+        let addr = 0x20 + c;
+        match MCPController::new(1, addr) {
+            Ok(mut m) => {
+                match m.initialize() {
+                    Ok(_) => {
+                        println!("[System] Successfully initialized MCP23017 #{} at I2C address 0x{:02X}", c + 1, addr);
+                        mcps.push(Some(m));
+                        active_mcp_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("[Warning] MCP23017 at 0x{:02X} failed to initialize registers: {}.", addr, e);
+                        mcps.push(None);
+                    }
+                }
             }
-            Some(m)
+            Err(_) => {
+                // Not found on the bus
+                mcps.push(None);
+            }
         }
-        Err(e) => {
-            eprintln!(
-                "[Warning] MCP23017 not detected on /dev/i2c-1: {}.\n\
-                 Running in virtual MCP simulation mode.",
-                e
-            );
-            None
-        }
-    };
+    }
+
+    println!("[System] Dynamic I2C Scan Complete. Found {} active MCP23017 board(s).", active_mcp_count);
 
     // 4. Initialize global App Context (Startup color: ALL BLUE)
     let context = Arc::new(AppContext {
         state: Mutex::new(SystemState {
             colors: [(0, 0, 150); 64], // Solid Blue on startup
-            cursor_index: 0,
             active_color_index: 0,
-            relay_state: 0x00,
+            relay_states: [0x00; 8], // All relays off initially
         }),
-        hardware: Mutex::new(Some(HardwareControllers { strip, mcp })),
+        hardware: Mutex::new(Some(HardwareControllers { strip, mcps })),
         tx: broadcast::channel(100).0,
     });
 
     // Write initial Blue state to hardware immediately
     context.update_hardware();
 
-    // 5. Spawn background task to poll MCP23017 physical buttons with soft debounce
+    // 5. Spawn background task to poll buttons across all 8 chips with soft debounce
     let context_hw = Arc::clone(&context);
     tokio::task::spawn_blocking(move || {
-        let mut prev_buttons = 0xFF; // Start with all buttons released (internal pull-ups high)
-        println!("[Hardware] Physical Button Polling Thread Started.");
+        let mut prev_buttons = [0xFF; 8]; // Start with all buttons released (internal pull-ups high)
+        println!("[Hardware] Physical Button Polling Thread Started (Scanning 8 boards).");
         
         loop {
-            let buttons_opt = {
-                let mut hw_lock = context_hw.hardware.lock().unwrap();
-                if let Some(ref mut hw) = *hw_lock {
-                    if let Some(ref mut mcp) = hw.mcp {
-                        mcp.read_buttons().ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some(buttons) = buttons_opt {
-                if buttons != prev_buttons {
-                    // Soft Debounce Delay
-                    std::thread::sleep(Duration::from_millis(25));
-                    
-                    let confirmed_buttons_opt = {
-                        let mut hw_lock = context_hw.hardware.lock().unwrap();
-                        if let Some(ref mut hw) = *hw_lock {
-                            if let Some(ref mut mcp) = hw.mcp {
-                                mcp.read_buttons().ok()
-                            } else {
-                                None
-                            }
+            for c in 0..8 {
+                let buttons_opt = {
+                    let mut hw_lock = context_hw.hardware.lock().unwrap();
+                    if let Some(ref mut hw) = *hw_lock {
+                        if let Some(Some(mcp)) = hw.mcps.get_mut(c) {
+                            mcp.read_buttons().ok()
                         } else {
                             None
                         }
-                    };
+                    } else {
+                        None
+                    }
+                };
 
-                    if let Some(confirmed_buttons) = confirmed_buttons_opt {
-                        if confirmed_buttons == buttons {
-                            // Detect transition from 1 (released) to 0 (pressed)
-                            let pressed_mask = prev_buttons & !confirmed_buttons;
-
-                            for i in 0..8 {
-                                if (pressed_mask & (1 << i)) != 0 {
-                                    println!("[Hardware] Physical Button {} (Color: {:?}) Pressed!", i, i);
-                                    
-                                    let mut state = context_hw.state.lock().unwrap();
-                                    
-                                    // Paint current cursor with the color mapping to the button
-                                    let cursor = state.cursor_index;
-                                    state.colors[cursor] = COLOR_PALETTE[i];
-                                    
-                                    // Toggle corresponding relay to trigger satisfying clicks
-                                    state.relay_state ^= 1 << i;
-
-                                    // Advance the cursor
-                                    state.cursor_index = (state.cursor_index + 1) % 64;
-
-                                    drop(state);
-
-                                    // Apply to physical strip & relays
-                                    context_hw.update_hardware();
-                                    
-                                    // Synchronize active screens in real-time
-                                    context_hw.broadcast_state();
+                if let Some(buttons) = buttons_opt {
+                    if buttons != prev_buttons[c] {
+                        // Soft Debounce Delay
+                        std::thread::sleep(Duration::from_millis(20));
+                        
+                        let confirmed_buttons_opt = {
+                            let mut hw_lock = context_hw.hardware.lock().unwrap();
+                            if let Some(ref mut hw) = *hw_lock {
+                                if let Some(Some(mcp)) = hw.mcps.get_mut(c) {
+                                    mcp.read_buttons().ok()
+                                } else {
+                                    None
                                 }
+                            } else {
+                                None
                             }
-                            prev_buttons = confirmed_buttons;
+                        };
+
+                        if let Some(confirmed_buttons) = confirmed_buttons_opt {
+                            if confirmed_buttons == buttons {
+                                // Detect transition from 1 (released) to 0 (pressed)
+                                let pressed_mask = prev_buttons[c] & !confirmed_buttons;
+
+                                for p in 0..8 {
+                                    if (pressed_mask & (1 << p)) != 0 {
+                                        // Map to absolute 0-63 grid coordinate
+                                        let absolute_index = c * 8 + p;
+                                        println!(
+                                            "[Hardware] Physical Button {} (Chip: 0x{:02X}, Pin: GPB{}) Pressed!",
+                                            absolute_index, 0x20 + c, p
+                                        );
+                                        
+                                        let mut state = context_hw.state.lock().unwrap();
+                                        
+                                        // Cycle the color of LED at the corresponding absolute index
+                                        let current_color = state.colors[absolute_index];
+                                        let next_color = get_next_color(current_color);
+                                        state.colors[absolute_index] = next_color;
+                                        
+                                        // Toggle corresponding physical relay
+                                        state.relay_states[c] ^= 1 << p;
+
+                                        drop(state);
+
+                                        // Apply to physical hardware
+                                        context_hw.update_hardware();
+                                        
+                                        // Synchronize active screens in real-time
+                                        context_hw.broadcast_state();
+                                    }
+                                }
+                                prev_buttons[c] = confirmed_buttons;
+                            }
                         }
                     }
                 }
             }
 
-            // Sleep to keep CPU consumption at 0%
-            std::thread::sleep(Duration::from_millis(35));
+            // High frequency scan rate keeping CPU consumption at <0.5%
+            std::thread::sleep(Duration::from_millis(15));
         }
     });
 
@@ -241,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let mut state = context_shutdown.state.lock().unwrap();
             state.colors = [(0, 0, 0); 64];
-            state.relay_state = 0x00;
+            state.relay_states = [0x00; 8];
         }
 
         // Apply blank states to hardware
@@ -289,9 +321,8 @@ async fn handle_socket(socket: WebSocket, context: Arc<AppContext>) {
         serde_json::json!({
             "type": "state",
             "colors": &state.colors[..],
-            "cursor": state.cursor_index,
             "active_color": state.active_color_index,
-            "relay_state": state.relay_state
+            "relay_states": state.relay_states
         }).to_string()
     };
     let _ = sender.send(Message::Text(initial_msg)).await;
@@ -319,7 +350,6 @@ async fn handle_socket(socket: WebSocket, context: Arc<AppContext>) {
                     ClientCommand::Paint { index, color_index } => {
                         if index < 64 && color_index < 8 {
                             state.colors[index] = COLOR_PALETTE[color_index];
-                            state.cursor_index = index; // Move cursor to active paint location
                             state_changed = true;
                         }
                     }
@@ -330,8 +360,10 @@ async fn handle_socket(socket: WebSocket, context: Arc<AppContext>) {
                         }
                     }
                     ClientCommand::ToggleRelay { relay_index } => {
-                        if relay_index < 8 {
-                            state.relay_state ^= 1 << relay_index;
+                        if relay_index < 64 {
+                            let c = relay_index / 8;
+                            let p = relay_index % 8;
+                            state.relay_states[c] ^= 1 << p;
                             state_changed = true;
                         }
                     }
@@ -343,6 +375,7 @@ async fn handle_socket(socket: WebSocket, context: Arc<AppContext>) {
                     }
                     ClientCommand::ClearAll => {
                         state.colors = [(0, 0, 0); 64];
+                        state.relay_states = [0x00; 8];
                         state_changed = true;
                     }
                 }
@@ -364,7 +397,7 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NeuraSync NeoPixel Matrix Control</title>
+    <title>NeuraSync 64-Channel Matrix Control</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -422,13 +455,13 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             display: grid;
             grid-template-columns: 1fr;
             gap: 30px;
-            max-width: 1100px;
+            max-width: 1200px;
             width: 100%;
         }
 
-        @media (min-width: 900px) {
+        @media (min-width: 950px) {
             .dashboard {
-                grid-template-columns: 1.2fr 1fr;
+                grid-template-columns: 1.1fr 1fr;
             }
         }
 
@@ -477,6 +510,9 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             border: 1px solid rgba(255, 255, 255, 0.05);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .led-cell:hover {
@@ -485,21 +521,12 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             box-shadow: 0 0 15px currentColor;
         }
 
-        .led-cell.active-cursor {
-            outline: 2px solid #ffffff;
-            outline-offset: 1px;
-            animation: pulse-border 1.5s infinite alternate;
-        }
-
-        @keyframes pulse-border {
-            0% {
-                outline-color: rgba(255, 255, 255, 0.4);
-                box-shadow: 0 0 4px rgba(255, 255, 255, 0.4);
-            }
-            100% {
-                outline-color: rgba(255, 255, 255, 1);
-                box-shadow: 0 0 12px rgba(255, 255, 255, 1);
-            }
+        .led-label {
+            font-size: 0.65rem;
+            font-weight: 800;
+            color: rgba(255, 255, 255, 0.25);
+            pointer-events: none;
+            user-select: none;
         }
 
         /* Color Palette */
@@ -596,24 +623,24 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             box-shadow: 0 0 15px rgba(0, 210, 255, 0.3);
         }
 
-        /* Relays Panel */
+        /* 64 Relays Grid */
         .relays-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
+            grid-template-columns: repeat(8, 1fr);
+            gap: 6px;
             width: 100%;
         }
 
         .relay-card {
             background: rgba(255, 255, 255, 0.02);
             border: 1px solid var(--border-glass);
-            border-radius: 18px;
-            padding: 15px 10px;
+            border-radius: 8px;
+            padding: 8px 2px;
             cursor: pointer;
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 10px;
+            gap: 6px;
             transition: all 0.2s ease;
         }
 
@@ -624,12 +651,12 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
         .relay-card.active {
             border-color: var(--neon-green);
             background: rgba(0, 255, 135, 0.05);
-            box-shadow: 0 0 15px rgba(0, 255, 135, 0.15);
+            box-shadow: 0 0 10px rgba(0, 255, 135, 0.15);
         }
 
         .relay-status {
-            width: 10px;
-            height: 10px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
             background-color: #3f4e60;
             transition: all 0.2s ease;
@@ -637,17 +664,24 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 
         .relay-card.active .relay-status {
             background-color: var(--neon-green);
-            box-shadow: 0 0 8px var(--neon-green);
+            box-shadow: 0 0 6px var(--neon-green);
         }
 
         .relay-label {
-            font-size: 0.85rem;
+            font-size: 0.65rem;
             font-weight: 600;
             color: var(--text-muted);
+            text-align: center;
         }
 
         .relay-card.active .relay-label {
             color: var(--neon-green);
+        }
+
+        .relay-chip-addr {
+            font-size: 0.52rem;
+            color: rgba(255,255,255,0.22);
+            margin-top: -3px;
         }
 
         /* Status bar */
@@ -685,8 +719,8 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 </head>
 <body>
     <div class="title-container">
-        <h1>NeuraSync LED Interface</h1>
-        <div class="subtitle">Bi-Directional Pi 5 Hardware Control Suite</div>
+        <h1>NeuraSync 64-Channel Control Matrix</h1>
+        <div class="subtitle">Raspberry Pi 5 Octa-Board Hardware Suite</div>
     </div>
 
     <div class="dashboard">
@@ -720,9 +754,9 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             </div>
 
             <!-- Relay Row -->
-            <div class="panel-title" style="margin-top: 15px;">
+            <div class="panel-title" style="margin-top: 10px;">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
-                MCP23017 Relays
+                64-Channel Hardware Relays
             </div>
             <div class="relays-grid" id="relays"></div>
         </div>
@@ -760,11 +794,17 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
         const statusDot = document.getElementById("status-dot");
         const statusText = document.getElementById("status-text");
 
-        // 1. Create Grid cells
+        // 1. Create Grid cells (with visible positions 1 to 64)
         for (let i = 0; i < 64; i++) {
             const cell = document.createElement("div");
             cell.className = "led-cell";
             cell.id = `cell-${i}`;
+            
+            const label = document.createElement("span");
+            label.className = "led-label";
+            label.innerText = i + 1;
+            
+            cell.appendChild(label);
             cell.addEventListener("click", () => {
                 sendPaint(i);
             });
@@ -794,8 +834,11 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             paletteEl.appendChild(swatch);
         });
 
-        // 3. Create Relay cards
-        for (let i = 0; i < 8; i++) {
+        // 3. Create 64 Relay cards labeled with index and chip address
+        for (let i = 0; i < 64; i++) {
+            const chipIndex = Math.floor(i / 8);
+            const chipAddr = (0x20 + chipIndex).toString(16).toUpperCase();
+            
             const card = document.createElement("div");
             card.className = "relay-card";
             card.id = `relay-${i}`;
@@ -805,10 +848,15 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
             
             const label = document.createElement("div");
             label.className = "relay-label";
-            label.innerText = `Relay ${i + 1}`;
+            label.innerText = `R${i + 1}`;
+            
+            const addr = document.createElement("div");
+            addr.className = "relay-chip-addr";
+            addr.innerText = `0x${chipAddr}`;
 
             card.appendChild(dot);
             card.appendChild(label);
+            card.appendChild(addr);
             card.addEventListener("click", () => {
                 toggleRelay(i);
             });
@@ -859,11 +907,11 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
                 const cell = document.getElementById(`cell-${idx}`);
                 if (cell) {
                     cell.style.backgroundColor = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-                    cell.style.color = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-                    if (idx === state.cursor) {
-                        cell.classList.add("active-cursor");
-                    } else {
-                        cell.classList.remove("active-cursor");
+                    // Update text contrast dynamically based on LED color
+                    const luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+                    const label = cell.querySelector(".led-label");
+                    if (label) {
+                        label.style.color = luminance > 80 ? 'rgba(0,0,0,0.6)' : 'rgba(255,255,255,0.4)';
                     }
                 }
             });
@@ -878,16 +926,19 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
                 }
             });
 
-            // Update Relays
-            const mask = state.relay_state;
-            for (let i = 0; i < 8; i++) {
-                const card = document.getElementById(`relay-${i}`);
-                if (card) {
-                    const active = (mask & (1 << i)) !== 0;
-                    if (active) {
-                        card.classList.add("active");
-                    } else {
-                        card.classList.remove("active");
+            // Update 64 Relays
+            for (let c = 0; c < 8; c++) {
+                const mask = state.relay_states[c];
+                for (let p = 0; p < 8; p++) {
+                    const absolute_index = c * 8 + p;
+                    const card = document.getElementById(`relay-${absolute_index}`);
+                    if (card) {
+                        const active = (mask & (1 << p)) !== 0;
+                        if (active) {
+                            card.classList.add("active");
+                        } else {
+                            card.classList.remove("active");
+                        }
                     }
                 }
             }
