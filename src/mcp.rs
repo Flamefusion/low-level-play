@@ -1,7 +1,5 @@
 use i2cdev::core::I2CDevice;
 use i2cdev::linux::LinuxI2CDevice;
-use std::fs::OpenOptions;
-use std::os::unix::io::AsRawFd;
 
 // Registers
 const IODIRA: u8 = 0x00;
@@ -11,16 +9,15 @@ const GPIOB: u8 = 0x13;
 
 pub struct MCPController {
     device: LinuxI2CDevice,
-    address: u16,
 }
 
 impl MCPController {
     /// Creates a new MCP controller on the specified I2C bus and address
     pub fn new(bus_number: u8, address: u16) -> Result<Self, Box<dyn std::error::Error>> {
         let bus_path = format!("/dev/i2c-{}", bus_number);
-        let mut device = LinuxI2CDevice::new(&bus_path, address)?;
+        let device = LinuxI2CDevice::new(&bus_path, address)?;
 
-        Ok(Self { device, address })
+        Ok(Self { device })
     }
 
     /// Initializes Port A as outputs (relays) and Port B as inputs (buttons)

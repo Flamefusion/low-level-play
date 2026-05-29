@@ -1,5 +1,4 @@
 use spidev::{SpiModeFlags, Spidev, SpidevOptions};
-use std::fs::File;
 use std::io::Write;
 
 pub struct NeoPixelStrip {

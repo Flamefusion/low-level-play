@@ -1,4 +1,4 @@
-use gpiod::{Chip, Options, RequestFlags};
+use gpiod::{Chip, Options};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -9,21 +9,17 @@ pub fn initialize_mcp_resets() -> Result<(), Box<dyn std::error::Error>> {
     // Open gpiochip0 (the primary RP1 GPIO expander on Pi 5)
     let chip = Chip::new("/dev/gpiochip0")?;
 
-    // We want to control the GPIO lines 5, 6, 12, 13
-    let lines = [5, 6, 12, 13];
+    // Request GPIO lines 5, 6, 12, 13 as outputs
+    let options = Options::output([5, 6, 12, 13]).consumer("mcp-reset");
 
-    // Request all reset lines as output lines
-    let mut options = Options::new();
-    options.direction(gpiod::Direction::Output);
-
-    let requested = chip.request_lines(&lines, &options)?;
+    let requested = chip.request_lines(options)?;
 
     // Pull reset LOW for 10 milliseconds to force a physical hardware reset
-    requested.set_values(&[0, 0, 0, 0])?;
+    requested.set_values([false, false, false, false])?;
     sleep(Duration::from_millis(10));
 
     // Pull reset HIGH to release the MCP chips and boot them up!
-    requested.set_values(&[1, 1, 1, 1])?;
+    requested.set_values([true, true, true, true])?;
     println!("MCP Chips successfully pulled out of Hardware Reset!");
 
     // Important: To prevent the line from falling back to low when the program finishes,
