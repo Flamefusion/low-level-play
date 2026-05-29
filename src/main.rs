@@ -45,22 +45,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mcp.initialize()?;
 
     // 4. Create an elegant LED color cycle (red, green, blue patterns)
-    if strip.is_some() {
-        println!("Setting LED strip colors...");
+    if let Some(ref mut s) = strip {
+        println!("Illuminating NeoPixel LED strip sequentially...");
         let mut led_colors = vec![(0, 0, 0); 64];
 
-        // Draw a pattern of repeating Red, Green, Blue on the LED strip
         for i in 0..64 {
+            // Draw a pattern of repeating Red, Green, Blue on the LED strip
             led_colors[i] = match i % 3 {
                 0 => (30, 0, 0), // Soft Red
                 1 => (0, 30, 0), // Soft Green
                 _ => (0, 0, 30), // Soft Blue
             };
-        }
-        if let Some(ref mut s) = strip {
             s.show(&led_colors)?;
+            // 20ms pause for a smooth animated wipe-on effect
+            sleep(Duration::from_millis(20));
         }
-        println!("LED strip illuminated!");
+        println!("LED strip fully illuminated!");
     }
 
     // 5. Test MCP23017 Relays and Buttons in a short loop
@@ -80,6 +80,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             step, relay_state, buttons
         );
 
+        // Animate the LED strip: shift the color pattern dynamically with each step
+        if let Some(ref mut s) = strip {
+            let mut led_colors = vec![(0, 0, 0); 64];
+            for i in 0..64 {
+                led_colors[i] = match (i + step) % 3 {
+                    0 => (30, 0, 0), // Soft Red
+                    1 => (0, 30, 0), // Soft Green
+                    _ => (0, 0, 30), // Soft Blue
+                };
+            }
+            s.show(&led_colors)?;
+        }
+
         // Rotate the bit so next relay turns on
         relay_state = relay_state.rotate_left(1);
 
@@ -89,9 +102,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clean up: turn off relays and clear LEDs when exiting
     println!("\nShutting down hardware cleanly...");
     mcp.set_relays(0x00)?;
+
     if let Some(ref mut s) = strip {
-        s.show(&vec![(0, 0, 0); 64])?;
+        println!("Extinguishing NeoPixels sequentially...");
+        // Recreate the final color state as a starting point for the wipe-off
+        let mut current_colors = vec![(0, 0, 0); 64];
+        for i in 0..64 {
+            current_colors[i] = match (i + 19) % 3 {
+                0 => (30, 0, 0),
+                1 => (0, 30, 0),
+                _ => (0, 0, 30),
+            };
+        }
+        
+        // Turn them off sequentially from the end of the strip to the start
+        for i in (0..64).rev() {
+            current_colors[i] = (0, 0, 0);
+            s.show(&current_colors)?;
+            sleep(Duration::from_millis(15));
+        }
     }
+
     println!("Goodbye!");
 
     Ok(())
