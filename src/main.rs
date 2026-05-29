@@ -21,7 +21,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Initialize NeoPixel SPI strip (64 LEDs)
     println!("Initializing NeoPixel LED strip...");
-    let mut strip = NeoPixelStrip::new(64)?;
+    let mut strip = match NeoPixelStrip::new(64) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "[Warning] Failed to initialize NeoPixel LED strip: {}.\n\
+                 Ensure SPI is enabled on your Raspberry Pi (via sudo raspi-config or dtparam=spi=on in config.txt).\n\
+                 Proceeding with I2C MCP23017 relay control loop...",
+                e
+            );
+            None
+        }
+    };
 
     // 3. Initialize MCP chip #1 (Address 0x20) on Bus 1 (or 13/14, adapt based on auto-detection)
     let bus_number = 1;
@@ -34,19 +45,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mcp.initialize()?;
 
     // 4. Create an elegant LED color cycle (red, green, blue patterns)
-    println!("Setting LED strip colors...");
-    let mut led_colors = vec![(0, 0, 0); 64];
+    if strip.is_some() {
+        println!("Setting LED strip colors...");
+        let mut led_colors = vec![(0, 0, 0); 64];
 
-    // Draw a pattern of repeating Red, Green, Blue on the LED strip
-    for i in 0..64 {
-        led_colors[i] = match i % 3 {
-            0 => (30, 0, 0), // Soft Red
-            1 => (0, 30, 0), // Soft Green
-            _ => (0, 0, 30), // Soft Blue
-        };
+        // Draw a pattern of repeating Red, Green, Blue on the LED strip
+        for i in 0..64 {
+            led_colors[i] = match i % 3 {
+                0 => (30, 0, 0), // Soft Red
+                1 => (0, 30, 0), // Soft Green
+                _ => (0, 0, 30), // Soft Blue
+            };
+        }
+        if let Some(ref mut s) = strip {
+            s.show(&led_colors)?;
+        }
+        println!("LED strip illuminated!");
     }
-    strip.show(&led_colors)?;
-    println!("LED strip illuminated!");
 
     // 5. Test MCP23017 Relays and Buttons in a short loop
     println!("\nStarting hardware control loop. Press Ctrl+C to exit.");
@@ -74,7 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clean up: turn off relays and clear LEDs when exiting
     println!("\nShutting down hardware cleanly...");
     mcp.set_relays(0x00)?;
-    strip.show(&vec![(0, 0, 0); 64])?;
+    if let Some(ref mut s) = strip {
+        s.show(&vec![(0, 0, 0); 64])?;
+    }
     println!("Goodbye!");
 
     Ok(())
