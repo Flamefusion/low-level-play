@@ -4,6 +4,7 @@ use i2cdev::linux::LinuxI2CDevice;
 // Registers
 const IODIRA: u8 = 0x00;
 const IODIRB: u8 = 0x01;
+const GPPUB: u8 = 0x0D;
 const GPIOA: u8 = 0x12;
 const GPIOB: u8 = 0x13;
 
@@ -20,13 +21,16 @@ impl MCPController {
         Ok(Self { device })
     }
 
-    /// Initializes Port A as outputs (relays) and Port B as inputs (buttons)
+    /// Initializes Port A as outputs (relays) and Port B as inputs (buttons) with pull-ups
     pub fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Write 0x00 to IODIRA -> Set all pins on Port A as OUTPUT
         self.device.smbus_write_byte_data(IODIRA, 0x00)?;
 
         // Write 0xFF to IODIRB -> Set all pins on Port B as INPUT
         self.device.smbus_write_byte_data(IODIRB, 0xFF)?;
+
+        // Write 0xFF to GPPUB -> Enable 100k pull-up resistors on Port B
+        self.device.smbus_write_byte_data(GPPUB, 0xFF)?;
 
         Ok(())
     }

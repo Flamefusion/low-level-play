@@ -12,3 +12,10 @@ gpiod = "0.2.1"
 i2cdev = "0.6.0"
 # For managing binary operations (bitwise shifting, registers)
 nix = { version = "0.27", features = ["ioctl", "fs"] }
+
+# Async runtime and web sockets
+tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
