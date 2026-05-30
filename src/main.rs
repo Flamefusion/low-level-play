@@ -166,6 +166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mcps.push(None);
             }
         }
+        
+        // Official hardware specification: sleep 50ms between chip address initializations
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     println!("[System] Dynamic I2C Scan Complete. Found {} active MCP23017 board(s).", active_mcp_count);

@@ -1,5 +1,6 @@
 use i2cdev::core::I2CDevice;
 use i2cdev::linux::LinuxI2CDevice;
+use std::time::Duration;
 
 // Registers
 const IODIRA: u8 = 0x00;
@@ -25,6 +26,9 @@ impl MCPController {
     pub fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Write 0x00 to IODIRA -> Set all pins on Port A as OUTPUT
         self.device.smbus_write_byte_data(IODIRA, 0x00)?;
+
+        // Official hardware specification: sleep 10ms before writing Port B register
+        std::thread::sleep(Duration::from_millis(10));
 
         // Write 0xFF to IODIRB -> Set all pins on Port B as INPUT
         self.device.smbus_write_byte_data(IODIRB, 0xFF)?;
