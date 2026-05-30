@@ -14,15 +14,11 @@ pub fn initialize_mcp_resets() -> Result<gpiod::Lines<gpiod::Output>, Box<dyn st
 
     let requested = chip.request_lines(options)?;
 
-    // Pull reset LOW for 10 milliseconds to force a physical hardware reset
-    requested.set_values([false, false, false, false])?;
-    sleep(Duration::from_millis(10));
-
-    // Pull reset HIGH to release the MCP chips and boot them up!
+    // Set the reset lines HIGH immediately to deassert reset (matching the Python start sequence 100% exactly)
     requested.set_values([true, true, true, true])?;
     
-    // Give the MCP23017 chips 150 milliseconds to fully boot and stabilize their internal oscillators
-    sleep(Duration::from_millis(150));
+    // Give the MCP23017 chips 50 milliseconds to fully stabilize
+    sleep(Duration::from_millis(50));
     
     println!("MCP Chips successfully pulled out of Hardware Reset and stabilized!");
 
