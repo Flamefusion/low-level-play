@@ -9,6 +9,7 @@ pub struct NeoPixelStrip {
 impl NeoPixelStrip {
     /// Opens and configures /dev/spidev0.0 for WS2812B control
     pub fn new(num_leds: usize) -> std::io::Result<Self> {
+        log::info!("Opening /dev/spidev0.0 for NeoPixel WS2812B control ({} LEDs)...", num_leds);
         let mut spi = Spidev::open("/dev/spidev0.0")?;
 
         // WS2812B expects ~3MHz to 4MHz SPI clock to map bits accurately
@@ -19,12 +20,14 @@ impl NeoPixelStrip {
             .build();
 
         spi.configure(&options)?;
+        log::debug!("SPI device configured successfully (mode 0, 3MHz, 8 bits/word).");
         Ok(Self { spi, num_leds })
     }
 
     /// Renders RGB colors to the LED strip
     /// `colors` is a slice of (r, g, b) tuples, one for each LED
     pub fn show(&mut self, colors: &[(u8, u8, u8)]) -> std::io::Result<()> {
+        log::trace!("Writing RGB color buffer to NeoPixel strip...");
         // WS2812B/SK6812 expects colors in GRB format (Green, Red, Blue)
         let mut spi_buffer = Vec::new();
 

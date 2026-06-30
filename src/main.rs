@@ -8,11 +8,14 @@ use std::thread::sleep;
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("--- 🦀 Low-Level Rust Hardware Control ---");
+    // Initialize env_logger to support structured log levels (INFO, WARN, DEBUG, TRACE)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    log::info!("--- 🦀 Low-Level Rust Hardware Control ---");
 
     // 1. Release hardware resets via GPIO
     if let Err(e) = gpio::initialize_mcp_resets() {
-        eprintln!(
+        log::error!(
             "Failed to reset MCP chips: {}. Ensure you are running as sudo or have gpio permissions.",
             e
         );
@@ -20,12 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Initialize NeoPixel SPI strip (64 LEDs)
-    println!("Initializing NeoPixel LED strip...");
+    log::info!("Initializing NeoPixel LED strip...");
     let mut strip = match NeoPixelStrip::new(64) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "[Warning] Failed to initialize NeoPixel LED strip: {}.\n\
+            log::warn!(
+                "Failed to initialize NeoPixel LED strip: {}.\n\
                  Ensure SPI is enabled on your Raspberry Pi (via sudo raspi-config or dtparam=spi=on in config.txt).\n\
                  Proceeding with I2C MCP23017 relay control loop...",
                 e
@@ -34,19 +37,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 3. Initialize MCP chip #1 (Address 0x20) on Bus 1 (or 13/14, adapt based on auto-detection)
+    // 3. Initialize MCP chip #1 (Address 0x20) on Bus 1 (with self-healing retry logic)
     let bus_number = 1;
     let mcp_address = 0x20;
-    println!(
-        "Connecting to MCP23017 #1 at bus {} addr 0x{:02X}...",
-        bus_number, mcp_address
-    );
-    let mut mcp = MCPController::new(bus_number, mcp_address)?;
-    mcp.initialize()?;
+    
+    let mut mcp = {
+        let mut mcp_instance = None;
+        let mut attempts = 0;
+        let max_attempts = 3;
+        
+        while attempts < max_attempts {
+            attempts += 1;
+            log::info!(
+                "Connecting to MCP23017 #1 at bus {} addr 0x{:02X} (attempt {}/{})...",
+                bus_number, mcp_address, attempts, max_attempts
+            );
+            
+            match MCPController::new(bus_number, mcp_address) {
+                Ok(mut controller) => {
+                    match controller.initialize() {
+                        Ok(_) => {
+                            mcp_instance = Some(controller);
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("MCP controller connected but failed to initialize registers: {}.", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to establish MCP I2C device connection: {}.", e);
+                }
+            }
+            
+            if attempts < max_attempts {
+                log::info!("Attempting self-healing GPIO hardware reset before retry...");
+                let _ = gpio::initialize_mcp_resets();
+                sleep(Duration::from_millis(200));
+            }
+        }
+        
+        match mcp_instance {
+            Some(controller) => controller,
+            None => {
+                log::error!("Critical: MCP23017 initialization failed after {} attempts.", max_attempts);
+                return Err("Failed to initialize MCP controller".into());
+            }
+        }
+    };
 
     // 4. Create an elegant LED color cycle (red, green, blue patterns)
     if let Some(ref mut s) = strip {
-        println!("Illuminating NeoPixel LED strip sequentially...");
+        log::info!("Illuminating NeoPixel LED strip sequentially...");
         let mut led_colors = vec![(0, 0, 0); 64];
 
         for i in 0..64 {
@@ -56,26 +98,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 1 => (0, 30, 0), // Soft Green
                 _ => (0, 0, 30), // Soft Blue
             };
-            s.show(&led_colors)?;
+            if let Err(e) = s.show(&led_colors) {
+                log::warn!("Failed to write color state to NeoPixel strip at index {}: {}", i, e);
+            }
             // 20ms pause for a smooth animated wipe-on effect
             sleep(Duration::from_millis(20));
         }
-        println!("LED strip fully illuminated!");
+        log::info!("LED strip fully illuminated!");
     }
 
     // 5. Test MCP23017 Relays and Buttons in a short loop
-    println!("\nStarting hardware control loop. Press Ctrl+C to exit.");
+    log::info!("Starting hardware control loop. Press Ctrl+C to exit.");
     let mut relay_state = 0x01; // bitmask: start with relay 1 active (00000001)
 
     for step in 0..20 {
-        // Toggle the active relay byte
-        mcp.set_relays(relay_state)?;
+        // Toggle the active relay byte with self-healing retry logic
+        let mut attempts = 0;
+        let max_attempts = 3;
+        loop {
+            match mcp.set_relays(relay_state) {
+                Ok(_) => break,
+                Err(e) => {
+                    attempts += 1;
+                    log::warn!(
+                        "Failed to set relays on attempt {}/{}: {}. Attempting self-healing recovery...",
+                        attempts, max_attempts, e
+                    );
+                    if attempts >= max_attempts {
+                        log::error!("Critical: Max self-healing attempts reached. Aborting relay toggle.");
+                        return Err(e);
+                    }
+                    let _ = gpio::initialize_mcp_resets();
+                    let _ = mcp.initialize();
+                    sleep(Duration::from_millis(100));
+                }
+            }
+        }
 
-        // Read input buttons
-        let buttons = mcp.read_buttons()?;
+        // Read input buttons with self-healing retry logic
+        let mut attempts = 0;
+        let buttons = loop {
+            match mcp.read_buttons() {
+                Ok(b) => break b,
+                Err(e) => {
+                    attempts += 1;
+                    log::warn!(
+                        "Failed to read buttons on attempt {}/{}: {}. Attempting self-healing recovery...",
+                        attempts, max_attempts, e
+                    );
+                    if attempts >= max_attempts {
+                        log::error!("Critical: Max self-healing attempts reached. Aborting button read.");
+                        return Err(e);
+                    }
+                    let _ = gpio::initialize_mcp_resets();
+                    let _ = mcp.initialize();
+                    sleep(Duration::from_millis(100));
+                }
+            }
+        };
 
         // Print progress
-        println!(
+        log::info!(
             "[Step {:02}] Toggled relays to: 0b{:08b} | Buttons (Port B): 0b{:08b}",
             step, relay_state, buttons
         );
@@ -90,7 +173,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => (0, 0, 30), // Soft Blue
                 };
             }
-            s.show(&led_colors)?;
+            if let Err(e) = s.show(&led_colors) {
+                log::warn!("Failed to shift colors on NeoPixel strip during step {}: {}", step, e);
+            }
         }
 
         // Rotate the bit so next relay turns on
@@ -100,11 +185,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Clean up: turn off relays and clear LEDs when exiting
-    println!("\nShutting down hardware cleanly...");
-    mcp.set_relays(0x00)?;
+    log::info!("Shutting down hardware cleanly...");
+    if let Err(e) = mcp.set_relays(0x00) {
+        log::warn!("Failed to disable relays during cleanup: {}", e);
+    }
 
     if let Some(ref mut s) = strip {
-        println!("Extinguishing NeoPixels sequentially...");
+        log::info!("Extinguishing NeoPixels sequentially...");
         // Recreate the final color state as a starting point for the wipe-off
         let mut current_colors = vec![(0, 0, 0); 64];
         for i in 0..64 {
@@ -118,12 +205,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Turn them off sequentially from the end of the strip to the start
         for i in (0..64).rev() {
             current_colors[i] = (0, 0, 0);
-            s.show(&current_colors)?;
+            if let Err(e) = s.show(&current_colors) {
+                log::warn!("Failed to clear NeoPixel at index {} during shutdown: {}", i, e);
+            }
             sleep(Duration::from_millis(15));
         }
     }
 
-    println!("Goodbye!");
+    log::info!("Goodbye!");
 
     Ok(())
 }

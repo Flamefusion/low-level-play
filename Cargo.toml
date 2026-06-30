@@ -12,3 +12,5 @@ gpiod = "0.2.1"
 i2cdev = "0.6.0"
 # For managing binary operations (bitwise shifting, registers)
 nix = { version = "0.27", features = ["ioctl", "fs"] }
+log = "0.4.21"
+env_logger = "0.11.3"
